@@ -684,64 +684,14 @@ func handleSearch(args: [String: Value]?) throws -> String {
 
     clickElement(searchField)
     Thread.sleep(forTimeInterval: 0.3)
+    // Select all existing text (Cmd+A) then replace with new query
+    sendKeyEvent(keyCode: 0, flags: .maskCommand)  // Cmd+A
+    Thread.sleep(forTimeInterval: 0.1)
     _ = pasteText(query)
     Thread.sleep(forTimeInterval: 1.5)
 
     let resultElements = traverseAXTree(pid: pid)
-
-    // Find section headings to categorize results
-    let headings = findElements(in: resultElements, role: "AXHeading")
-    var chatsHeadingY: Double? = nil
-    var contactsHeadingY: Double? = nil
-    var mediaHeadingY: Double? = nil
-    for h in headings {
-        let text = cleanUnicode(h.description ?? h.title ?? "").lowercased()
-        if text == "chats" && h.x >= searchResultMinX { chatsHeadingY = h.y }
-        if text.contains("contact") && h.x >= searchResultMinX { contactsHeadingY = h.y }
-        if text == "media" && h.x >= searchResultMinX { mediaHeadingY = h.y }
-    }
-
-    // Collect all search result buttons — ONLY those below the first section heading
-    // (buttons above headings are ghost/container duplicates)
-    let firstSectionY = [chatsHeadingY, contactsHeadingY].compactMap { $0 }.min()
-    let buttons = findElements(in: resultElements, role: "AXButton")
-    var candidates: [(btn: AXElementInfo, section: String)] = []
-
-    for btn in buttons {
-        guard isSearchResultButton(btn) else { continue }
-
-        // Skip buttons above the first section heading (ghost/container elements)
-        if let firstY = firstSectionY, btn.y < firstY { continue }
-
-        // Skip media section
-        if let mediaY = mediaHeadingY, btn.y >= mediaY { continue }
-
-        // Determine section based on y position relative to headings
-        var section = "chats"
-        if let contactsY = contactsHeadingY, btn.y >= contactsY { section = "contacts" }
-        else if let chatsY = chatsHeadingY, btn.y >= chatsY { section = "chats" }
-
-        candidates.append((btn: btn, section: section))
-    }
-
-    // Sort by y position (top to bottom on screen — but note: y values may be negative, more negative = higher)
-    candidates.sort { $0.btn.y < $1.btn.y }
-
-    // Build results
-    var results: [SearchResult] = []
-    for (idx, entry) in candidates.enumerated() {
-        let rawDesc = cleanUnicode(entry.btn.bestText)
-        let parsed = parseButtonDescription(rawDesc)
-
-        results.append(SearchResult(
-            index: idx,
-            section: entry.section,
-            contactName: parsed.contactName,
-            rawDescription: String(rawDesc.prefix(200)),
-            preview: parsed.preview.map { String($0.prefix(150)) },
-            time: parsed.time
-        ))
-    }
+    let results = parseVisibleSearchResults(from: resultElements)
 
     fputs("log: handleSearch: query='\(query)', found \(results.count) results\n", stderr)
 
@@ -796,6 +746,54 @@ func handleOpenChat(args: [String: Value]?) throws -> String {
     return "{\"success\": true, \"clicked_description\": \"\(targetDesc.prefix(80).replacingOccurrences(of: "\"", with: "\\\""))\", \"active_chat\": \"\(activeName ?? "unknown")\"}"
 }
 
+// Parse visible search results from an already-traversed AX tree
+func parseVisibleSearchResults(from elements: [AXElementInfo]) -> [SearchResult] {
+    let headings = findElements(in: elements, role: "AXHeading")
+    var chatsHeadingY: Double? = nil
+    var contactsHeadingY: Double? = nil
+    var mediaHeadingY: Double? = nil
+    for h in headings {
+        let text = cleanUnicode(h.description ?? h.title ?? "").lowercased()
+        if text == "chats" && h.x >= searchResultMinX { chatsHeadingY = h.y }
+        if text.contains("contact") && h.x >= searchResultMinX { contactsHeadingY = h.y }
+        if text == "media" && h.x >= searchResultMinX { mediaHeadingY = h.y }
+    }
+
+    let firstSectionY = [chatsHeadingY, contactsHeadingY].compactMap { $0 }.min()
+    let buttons = findElements(in: elements, role: "AXButton")
+    var candidates: [(btn: AXElementInfo, section: String)] = []
+
+    for btn in buttons {
+        guard isSearchResultButton(btn) else { continue }
+        if let firstY = firstSectionY, btn.y < firstY { continue }
+        if let mediaY = mediaHeadingY, btn.y >= mediaY { continue }
+
+        var section = "chats"
+        if let contactsY = contactsHeadingY, btn.y >= contactsY { section = "contacts" }
+        else if let chatsY = chatsHeadingY, btn.y >= chatsY { section = "chats" }
+
+        candidates.append((btn: btn, section: section))
+    }
+
+    candidates.sort { $0.btn.y < $1.btn.y }
+
+    var results: [SearchResult] = []
+    for (idx, entry) in candidates.enumerated() {
+        let rawDesc = cleanUnicode(entry.btn.bestText)
+        let parsed = parseButtonDescription(rawDesc)
+
+        results.append(SearchResult(
+            index: idx,
+            section: entry.section,
+            contactName: parsed.contactName,
+            rawDescription: String(rawDesc.prefix(200)),
+            preview: parsed.preview.map { String($0.prefix(150)) },
+            time: parsed.time
+        ))
+    }
+    return results
+}
+
 // whatsapp_scroll_search: scroll within search results to load more
 func handleScrollSearch(args: [String: Value]?) throws -> String {
     let direction = getOptionalString(from: args, key: "direction") ?? "down"
@@ -812,18 +810,23 @@ func handleScrollSearch(args: [String: Value]?) throws -> String {
         return "{\"success\": false, \"error\": \"No search results visible to scroll\"}"
     }
 
-    // Scroll in the middle of the search results area
+    // Scroll in the center of the visible results list
+    let lastBtn = buttons.last ?? firstBtn
     let scrollX = firstBtn.x + firstBtn.width / 2
-    let scrollY = firstBtn.y + 100  // scroll area
+    let scrollY = (firstBtn.y + lastBtn.y) / 2  // midpoint of visible results
     let delta: Int32 = direction == "up" ? Int32(amount) : -Int32(amount)
 
-    scrollAt(x: scrollX, y: scrollY, deltaY: delta)
-    Thread.sleep(forTimeInterval: 0.5)
+    // Scroll multiple times for reliability (WhatsApp lazy-loads incrementally)
+    for _ in 0..<3 {
+        scrollAt(x: scrollX, y: scrollY, deltaY: delta)
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+    Thread.sleep(forTimeInterval: 0.3)
 
-    // Return updated results count
+    // Return full parsed results after scrolling
     let newElements = traverseAXTree(pid: pid)
-    let newButtons = findElements(in: newElements, role: "AXButton").filter { isSearchResultButton($0) }
-    return "{\"success\": true, \"direction\": \"\(direction)\", \"visible_results\": \(newButtons.count)}"
+    let results = parseVisibleSearchResults(from: newElements)
+    return serializeToJsonString(results) ?? "[]"
 }
 
 func handleReadMessages(args: [String: Value]?) throws -> String {
