@@ -46,6 +46,12 @@ func getOptionalInt(from args: [String: Value]?, key: String) throws -> Int? {
     return intValue
 }
 
+func cleanUnicode(_ s: String) -> String {
+    s.replacingOccurrences(
+        of: "[\u{200e}\u{200f}\u{200b}\u{200c}\u{200d}\u{2066}\u{2067}\u{2068}\u{2069}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}]",
+        with: "", options: .regularExpression)
+}
+
 // MARK: - WhatsApp Helpers
 
 let whatsAppBundleID = "net.whatsapp.WhatsApp"
@@ -61,6 +67,13 @@ func launchWhatsApp() throws {
     process.arguments = ["-a", "WhatsApp.app"]
     try process.run()
     process.waitUntilExit()
+}
+
+func quitWhatsApp() {
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppBundleID)
+    for app in apps {
+        app.terminate()
+    }
 }
 
 func ensureWhatsAppRunning() throws -> pid_t {
@@ -90,6 +103,16 @@ struct AXElementInfo {
     let y: Double
     let width: Double
     let height: Double
+
+    /// Best available text from any attribute
+    var bestText: String {
+        let d = cleanUnicode(description ?? "")
+        if !d.isEmpty { return d }
+        let t = cleanUnicode(title ?? "")
+        if !t.isEmpty { return t }
+        let v = cleanUnicode(value ?? "")
+        return v
+    }
 }
 
 func traverseAXTree(pid: pid_t, maxDepth: Int = 15) -> [AXElementInfo] {
@@ -169,13 +192,30 @@ func findElements(in elements: [AXElementInfo], role: String) -> [AXElementInfo]
 
 // MARK: - Click / Type / Key Helpers
 
+func saveCursorPosition() -> CGPoint? {
+    let nsPos = NSEvent.mouseLocation
+    guard let primaryScreen = NSScreen.screens.first else { return nil }
+    return CGPoint(x: nsPos.x, y: primaryScreen.frame.height - nsPos.y)
+}
+
+func restoreCursorPosition(_ pos: CGPoint) {
+    if let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                               mouseCursorPosition: pos, mouseButton: .left) {
+        moveEvent.post(tap: .cghidEventTap)
+    }
+}
+
 func clickAt(x: Double, y: Double) {
+    let savedPos = saveCursorPosition()
     let point = CGPoint(x: x, y: y)
     let source = CGEventSource(stateID: .hidSystemState)
     let mouseDown = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
     let mouseUp = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
     mouseDown?.post(tap: .cghidEventTap)
     mouseUp?.post(tap: .cghidEventTap)
+    if let savedPos = savedPos {
+        restoreCursorPosition(savedPos)
+    }
 }
 
 func clickElement(_ el: AXElementInfo) {
@@ -189,7 +229,6 @@ func pasteText(_ text: String) -> Bool {
     guard pb.setString(text, forType: .string) else { return false }
     sendKeyEvent(keyCode: 9, flags: .maskCommand) // Cmd+V
     Thread.sleep(forTimeInterval: 0.35)
-    // Restore clipboard
     pb.clearContents()
     if let backup = backup {
         _ = pb.setString(backup, forType: .string)
@@ -199,7 +238,6 @@ func pasteText(_ text: String) -> Bool {
 
 func sendKeyEvent(keyCode: CGKeyCode, flags: CGEventFlags = []) {
     let source = CGEventSource(stateID: .hidSystemState)
-    // Clear stuck modifiers for unmodified keys
     if flags.isEmpty {
         for code: CGKeyCode in [55, 56, 58, 59] {
             let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
@@ -216,7 +254,6 @@ func sendKeyEvent(keyCode: CGKeyCode, flags: CGEventFlags = []) {
     down?.post(tap: .cghidEventTap)
     up?.post(tap: .cghidEventTap)
     if !flags.isEmpty {
-        // Release modifiers
         for code: CGKeyCode in [55, 56, 58, 59] {
             let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
             up?.post(tap: .cghidEventTap)
@@ -225,12 +262,25 @@ func sendKeyEvent(keyCode: CGKeyCode, flags: CGEventFlags = []) {
     }
 }
 
-func pressReturn() {
-    sendKeyEvent(keyCode: 36) // Return
-}
+func pressReturn() { sendKeyEvent(keyCode: 36) }
+func pressEscape() { sendKeyEvent(keyCode: 53) }
 
-func pressEscape() {
-    sendKeyEvent(keyCode: 53) // Escape
+func scrollAt(x: Double, y: Double, deltaY: Int32) {
+    let savedPos = saveCursorPosition()
+    // Move mouse to scroll location
+    if let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                               mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) {
+        moveEvent.post(tap: .cghidEventTap)
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+    // Send scroll event
+    if let scrollEvent = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: deltaY, wheel2: 0, wheel3: 0) {
+        scrollEvent.post(tap: .cghidEventTap)
+    }
+    Thread.sleep(forTimeInterval: 0.3)
+    if let savedPos = savedPos {
+        restoreCursorPosition(savedPos)
+    }
 }
 
 // MARK: - Codable Response Types
@@ -254,6 +304,257 @@ struct StatusInfo: Codable {
     let accessibilityTrusted: Bool
 }
 
+struct SearchResult: Codable {
+    let index: Int
+    let section: String        // "chats", "contacts", or "media"
+    let contactName: String?   // parsed contact name (may be nil if not extractable)
+    let rawDescription: String // full raw AX description
+    let preview: String?       // message preview (for chat results)
+    let time: String?          // timestamp if found
+}
+
+struct ActiveChatInfo: Codable {
+    let name: String?
+    let subtitle: String?
+    let recentMessages: [MessageInfo]?
+}
+
+// MARK: - Search Result Parser
+
+/// Parses WhatsApp button descriptions into structured fields.
+/// Patterns observed:
+///   Sent: "Your message, {text}, {time}, Sent to {name}, {status} {name} Double tap..."
+///   Received: "message, {text}, {time}, {name} Double tap..."
+///   Group received: "Message from {sender}, {text}, {time}, Received in {name}, {count} unread..."
+///   Added: "Added by non-contact {name}, {count} unread messages..."
+///   Contact: Just "{name}" (short, no commas with message pattern)
+struct ParsedSearchResult {
+    var contactName: String?
+    var preview: String?
+    var time: String?
+}
+
+func parseButtonDescription(_ raw: String) -> ParsedSearchResult {
+    var result = ParsedSearchResult()
+    let text = raw.trimmingCharacters(in: .whitespaces)
+
+    // Pattern: "Sent to {name}" — extract name after "Sent to"
+    if let sentRange = text.range(of: #"Sent to ([^,]+)"#, options: .regularExpression) {
+        let match = String(text[sentRange])
+        result.contactName = match.replacingOccurrences(of: "Sent to ", with: "").trimmingCharacters(in: .whitespaces)
+    }
+
+    // Pattern: "Received in {name}" (groups)
+    if result.contactName == nil, let recvRange = text.range(of: #"Received in ([^,]+)"#, options: .regularExpression) {
+        let match = String(text[recvRange])
+        result.contactName = match.replacingOccurrences(of: "Received in ", with: "").trimmingCharacters(in: .whitespaces)
+    }
+
+    // Pattern: "Received from {name}"
+    if result.contactName == nil, let recvRange = text.range(of: #"Received from ([^,]+)"#, options: .regularExpression) {
+        let match = String(text[recvRange])
+        result.contactName = match.replacingOccurrences(of: "Received from ", with: "").trimmingCharacters(in: .whitespaces)
+    }
+
+    // Pattern: "Added by non-contact {name}, N unread"
+    if result.contactName == nil, let addedRange = text.range(of: #"Added by non-contact ([^,]+)"#, options: .regularExpression) {
+        let match = String(text[addedRange])
+        result.contactName = match.replacingOccurrences(of: "Added by non-contact ", with: "").trimmingCharacters(in: .whitespaces)
+    }
+
+    // If no pattern matched but text is short (< 60 chars) and doesn't start with "message," or "Your message," — treat as contact name
+    if result.contactName == nil {
+        let lower = text.lowercased()
+        if !lower.hasPrefix("message,") && !lower.hasPrefix("your message,") && !lower.hasPrefix("added by") {
+            // Likely a plain contact name or group name
+            // Strip "Double tap..." suffix if present
+            if let dtRange = text.range(of: "Double tap", options: .caseInsensitive) {
+                let before = String(text[text.startIndex..<dtRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+                if !before.isEmpty {
+                    result.contactName = before
+                }
+            } else {
+                result.contactName = text
+            }
+        }
+    }
+
+    // Extract time: pattern like "1:23 PM" or "12:34" within the text
+    if let timeMatch = text.range(of: #"\d{1,2}:\d{2}\s*[APap][Mm]"#, options: .regularExpression) {
+        result.time = String(text[timeMatch]).trimmingCharacters(in: .whitespaces)
+    } else if let timeMatch24 = text.range(of: #"\b\d{1,2}:\d{2}\b"#, options: .regularExpression) {
+        result.time = String(text[timeMatch24]).trimmingCharacters(in: .whitespaces)
+    }
+
+    // Extract preview: for "Your message, {text}," or "message, {text}," or "Message from {sender}, {text},"
+    if text.hasPrefix("Your message, ") {
+        let rest = String(text.dropFirst("Your message, ".count))
+        // Take everything up to the time
+        if let timeStr = result.time, let timeRange = rest.range(of: timeStr) {
+            result.preview = String(rest[rest.startIndex..<timeRange.lowerBound]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+        }
+    } else if text.hasPrefix("message, ") {
+        let rest = String(text.dropFirst("message, ".count))
+        if let timeStr = result.time, let timeRange = rest.range(of: timeStr) {
+            result.preview = String(rest[rest.startIndex..<timeRange.lowerBound]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+        }
+    } else if text.hasPrefix("Message from ") {
+        // "Message from {sender}, {text}, {time}, ..."
+        let rest = String(text.dropFirst("Message from ".count))
+        // Skip sender (up to first comma)
+        if let firstComma = rest.firstIndex(of: ",") {
+            let afterSender = String(rest[rest.index(after: firstComma)...]).trimmingCharacters(in: .whitespaces)
+            if let timeStr = result.time, let timeRange = afterSender.range(of: timeStr) {
+                result.preview = String(afterSender[afterSender.startIndex..<timeRange.lowerBound]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+            }
+        }
+    }
+
+    // Clean up: strip "Delivered", "Read", "Sent" status from contactName
+    if let name = result.contactName {
+        var cleaned = name
+        for suffix in ["Delivered", "Read", "Sent", "Pending"] {
+            if cleaned.hasSuffix(suffix) {
+                cleaned = String(cleaned.dropLast(suffix.count)).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+            }
+        }
+        // Strip "Double tap..." suffix
+        if let dtRange = cleaned.range(of: "Double tap", options: .caseInsensitive) {
+            cleaned = String(cleaned[cleaned.startIndex..<dtRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        result.contactName = cleaned.isEmpty ? nil : cleaned
+    }
+
+    return result
+}
+
+// MARK: - Shared: get active chat info from heading
+
+let sectionHeaders: Set<String> = ["chats", "other contacts", "contacts", "media", "today", "yesterday"]
+
+struct ChatHeadingInfo {
+    var name: String?
+    var subtitle: String?  // "online", "last seen today at 6:32 PM", "typing..."
+}
+
+func getActiveChatHeading(elements: [AXElementInfo]) -> ChatHeadingInfo {
+    var info = ChatHeadingInfo()
+    let headings = findElements(in: elements, role: "AXHeading")
+
+    // Find the chat panel heading (x > 1750, not a section header)
+    for h in headings {
+        let raw = cleanUnicode(h.description ?? h.title ?? "")
+        if raw.isEmpty { continue }
+        let lower = raw.lowercased()
+        if sectionHeaders.contains(lower) { continue }
+        if h.x > 1750 {
+            // Heading may contain "last seen today at 6:32 PM Nhat" or "online Nhat"
+            if let range = raw.range(of: #"^(last seen .+?|online|typing\.\.\.)\s+"#, options: .regularExpression) {
+                info.subtitle = String(raw[raw.startIndex..<range.upperBound]).trimmingCharacters(in: .whitespaces)
+                let name = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty { info.name = name }
+            } else {
+                info.name = raw.trimmingCharacters(in: .whitespaces)
+            }
+            return info
+        }
+    }
+
+    // Fallback: any heading that's not a section header
+    for h in headings {
+        let raw = cleanUnicode(h.description ?? h.title ?? "")
+        if raw.isEmpty { continue }
+        let lower = raw.lowercased()
+        if sectionHeaders.contains(lower) { continue }
+        if let range = raw.range(of: #"^(last seen .+?|online|typing\.\.\.)\s+"#, options: .regularExpression) {
+            info.subtitle = String(raw[raw.startIndex..<range.upperBound]).trimmingCharacters(in: .whitespaces)
+            let name = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { info.name = name }
+        } else {
+            info.name = raw.trimmingCharacters(in: .whitespaces)
+        }
+        return info
+    }
+
+    return info
+}
+
+/// Convenience: just the name
+func getActiveChatName(pid: pid_t) -> String? {
+    let elements = traverseAXTree(pid: pid)
+    return getActiveChatHeading(elements: elements).name
+}
+
+/// Parse messages from elements (shared between handleReadMessages and handleGetActiveChat)
+func parseMessages(from elements: [AXElementInfo], limit: Int) -> [MessageInfo] {
+    var messages: [MessageInfo] = []
+    let genericElements = findElements(in: elements, role: "AXGenericElement")
+    for el in genericElements {
+        let desc = cleanUnicode(el.description ?? "")
+        if desc.isEmpty { continue }
+        if desc.hasPrefix("message, ") || desc.hasPrefix("Your message, ") {
+            let isFromMe = desc.hasPrefix("Your message, ")
+            let prefix = isFromMe ? "Your message, " : "message, "
+            let rest = String(desc.dropFirst(prefix.count))
+            var sender = ""
+            var time = ""
+            var text = rest
+            if let receivedRange = rest.range(of: #",\s+Received from (.+)$"#, options: .regularExpression) {
+                let receivedPart = String(rest[receivedRange])
+                sender = receivedPart.replacingOccurrences(of: #"^,\s+Received from "#, with: "", options: .regularExpression)
+                text = String(rest[rest.startIndex..<receivedRange.lowerBound])
+            } else if let sentRange = rest.range(of: #",\s+Sent to (.+)$"#, options: .regularExpression) {
+                let sentPart = String(rest[sentRange])
+                sender = sentPart.replacingOccurrences(of: #"^,\s+Sent to "#, with: "", options: .regularExpression)
+                text = String(rest[rest.startIndex..<sentRange.lowerBound])
+            }
+            if let timeRange = text.range(of: #",\s+\d{1,2}:\d{2}\s*[APap][Mm]?$"#, options: .regularExpression) {
+                time = String(text[timeRange]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+                text = String(text[text.startIndex..<timeRange.lowerBound])
+            } else if let timeRange24 = text.range(of: #",\s+\d{1,2}:\d{2}$"#, options: .regularExpression) {
+                time = String(text[timeRange24]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+                text = String(text[text.startIndex..<timeRange24.lowerBound])
+            }
+            messages.append(MessageInfo(
+                sender: isFromMe ? "me" : sender.trimmingCharacters(in: .whitespaces),
+                text: text.trimmingCharacters(in: .whitespaces),
+                time: time,
+                isFromMe: isFromMe
+            ))
+        }
+    }
+    return Array(messages.suffix(limit))
+}
+
+// MARK: - Search Result Button Filtering
+
+let uiSkipKeywords: Set<String> = [
+    "chats", "calls", "updates", "settings", "search", "back", "close",
+    "all", "unread", "favorites", "groups", "new chat", "clear text",
+    "more info", "archived", "starred", "send", "share media",
+    "voice message", "video message", "start video call", "start voice call",
+    "photos", "gifs", "links", "videos", "documents", "audio", "polls", "events",
+    "new group", "new community"
+]
+
+/// Minimum x position for search result buttons (sidebar area)
+let searchResultMinX: Double = 1350
+
+/// Minimum width for search result buttons
+let searchResultMinWidth: Double = 200
+
+func isSearchResultButton(_ btn: AXElementInfo) -> Bool {
+    guard btn.x >= searchResultMinX, btn.width >= searchResultMinWidth else { return false }
+    let text = btn.bestText.lowercased()
+    if text.isEmpty { return false }
+    if uiSkipKeywords.contains(text) { return false }
+    // Skip tab filter buttons like "1 of 4 All..."
+    if text.range(of: #"^\d+ of \d+"#, options: .regularExpression) != nil { return false }
+    // Skip hex ID buttons
+    if text.range(of: #"^[0-9A-Fa-f ]{20,}$"#, options: .regularExpression) != nil { return false }
+    return true
+}
+
 // MARK: - Tool Implementations
 
 func handleStatus() -> String {
@@ -261,12 +562,56 @@ func handleStatus() -> String {
     let trusted = AXIsProcessTrustedWithOptions(
         [kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary
     )
-    let status = StatusInfo(
-        whatsappRunning: pid != nil,
-        pid: pid.map { Int($0) },
-        accessibilityTrusted: trusted
-    )
+    let status = StatusInfo(whatsappRunning: pid != nil, pid: pid.map { Int($0) }, accessibilityTrusted: trusted)
     return serializeToJsonString(status) ?? "{\"error\": \"serialization failed\"}"
+}
+
+func handleStart() -> String {
+    if let pid = getWhatsAppPid() {
+        return "{\"success\": true, \"already_running\": true, \"pid\": \(pid)}"
+    }
+    do {
+        try launchWhatsApp()
+        Thread.sleep(forTimeInterval: 2.0)
+        if let pid = getWhatsAppPid() {
+            return "{\"success\": true, \"already_running\": false, \"pid\": \(pid)}"
+        }
+        return "{\"success\": false, \"error\": \"WhatsApp did not start\"}"
+    } catch {
+        return "{\"success\": false, \"error\": \"\(error.localizedDescription)\"}"
+    }
+}
+
+func handleQuit() -> String {
+    guard getWhatsAppPid() != nil else {
+        return "{\"success\": true, \"was_running\": false}"
+    }
+    quitWhatsApp()
+    // Wait up to 5 seconds for graceful quit
+    for _ in 0..<10 {
+        Thread.sleep(forTimeInterval: 0.5)
+        if getWhatsAppPid() == nil {
+            return "{\"success\": true, \"was_running\": true}"
+        }
+    }
+    // Force quit if still running
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppBundleID)
+    for app in apps {
+        app.forceTerminate()
+    }
+    Thread.sleep(forTimeInterval: 1.0)
+    let stillRunning = getWhatsAppPid() != nil
+    return "{\"success\": \(!stillRunning), \"was_running\": true, \"force_quit\": true}"
+}
+
+func handleGetActiveChat(args: [String: Value]?) throws -> String {
+    let pid = try ensureWhatsAppRunning()
+    let elements = traverseAXTree(pid: pid)
+    let heading = getActiveChatHeading(elements: elements)
+    let limit = (try? getOptionalInt(from: args, key: "limit")) ?? 10
+    let messages = heading.name != nil ? parseMessages(from: elements, limit: limit) : nil
+    let info = ActiveChatInfo(name: heading.name, subtitle: heading.subtitle, recentMessages: messages)
+    return serializeToJsonString(info) ?? "{\"name\": null}"
 }
 
 func handleListChats(args: [String: Value]?) throws -> String {
@@ -275,8 +620,6 @@ func handleListChats(args: [String: Value]?) throws -> String {
     Thread.sleep(forTimeInterval: 0.5)
 
     let filter = getOptionalString(from: args, key: "filter")
-
-    // If a filter tab is requested, click it first
     if let filter = filter, filter != "all" {
         let elements = traverseAXTree(pid: pid)
         let filterName: String
@@ -293,32 +636,16 @@ func handleListChats(args: [String: Value]?) throws -> String {
     }
 
     let elements = traverseAXTree(pid: pid)
-
-    // Chat entries are AXButton elements in the sidebar with descriptions containing contact names
-    // They typically have desc like "Contact Name" or "Contact Name, 3 unread messages"
-    // and value like last message text
     var chats: [ChatInfo] = []
     let buttons = findElements(in: elements, role: "AXButton")
 
     for btn in buttons {
-        let desc = btn.description ?? ""
-        let val = btn.value ?? ""
-
-        // Strip Unicode directional markers (LTR \u{200e}, RTL \u{200f}, etc.)
-        let cleanDesc = desc.replacingOccurrences(of: "[\u{200e}\u{200f}\u{200b}\u{200c}\u{200d}\u{2066}\u{2067}\u{2068}\u{2069}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}]", with: "", options: .regularExpression)
+        let cleanDesc = cleanUnicode(btn.description ?? "")
         if cleanDesc.isEmpty { continue }
-
-        // Skip navigation buttons and filter buttons
-        let skipKeywords = ["Chats", "Calls", "Updates", "Settings", "New Chat", "Search",
-                           "All", "Unread", "Favorites", "Groups", "Archived", "Starred",
-                           "Community", "Channels", "Back", "Close", "Menu", "Filter",
-                           "More options", "New group", "New community",
-                           "Start video call", "Start voice call", "Share media",
-                           "Voice message", "Video message"]
         let descLower = cleanDesc.lowercased()
-        if skipKeywords.contains(where: { descLower == $0.lowercased() || descLower.hasPrefix($0.lowercased()) }) { continue }
+        if uiSkipKeywords.contains(descLower) { continue }
+        if descLower.hasPrefix("start ") { continue }
 
-        // Parse unread count from description (e.g. "Contact, 3 unread messages")
         var unread = 0
         var name = cleanDesc
         if let range = cleanDesc.range(of: #",\s*(\d+)\s+unread"#, options: .regularExpression) {
@@ -329,12 +656,10 @@ func handleListChats(args: [String: Value]?) throws -> String {
             name = String(cleanDesc[cleanDesc.startIndex..<range.lowerBound])
         }
 
-        // Skip entries that look like UI controls (short single words that match known controls)
         if name.count < 2 { continue }
-        // Skip hex-looking strings (likely element IDs)
         if name.range(of: #"^[0-9A-F ]{20,}$"#, options: .regularExpression) != nil { continue }
 
-        let cleanVal = val.replacingOccurrences(of: "[\u{200e}\u{200f}\u{200b}\u{200c}\u{200d}\u{2066}\u{2067}\u{2068}\u{2069}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}]", with: "", options: .regularExpression)
+        let cleanVal = cleanUnicode(btn.value ?? "")
         chats.append(ChatInfo(
             name: name.trimmingCharacters(in: .whitespaces),
             lastMessage: cleanVal.isEmpty ? nil : cleanVal,
@@ -345,162 +670,184 @@ func handleListChats(args: [String: Value]?) throws -> String {
     return serializeToJsonString(chats) ?? "[]"
 }
 
-func handleOpenChat(args: [String: Value]?) throws -> String {
-    let name = try getRequiredString(from: args, key: "name")
+// whatsapp_search: types query into sidebar search, returns indexed results, leaves search OPEN
+func handleSearch(args: [String: Value]?) throws -> String {
+    let query = try getRequiredString(from: args, key: "query")
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
     Thread.sleep(forTimeInterval: 0.5)
 
     let elements = traverseAXTree(pid: pid)
-
-    // Try to find the chat button by name
-    if let chatBtn = findElement(in: elements, text: name, role: "AXButton") {
-        clickElement(chatBtn)
-        Thread.sleep(forTimeInterval: 0.8)
-
-        // Verify by checking for heading with the name
-        let newElements = traverseAXTree(pid: pid)
-        if let heading = findElement(in: newElements, text: name, role: "AXHeading") {
-            return "{\"success\": true, \"chat\": \"\(heading.description ?? heading.title ?? name)\"}"
-        }
-        // Even without heading verification, the click likely worked
-        return "{\"success\": true, \"chat\": \"\(name)\", \"note\": \"clicked chat button, heading not verified\"}"
+    guard let searchField = findElement(in: elements, text: "Search", role: "AXStaticText") else {
+        return "{\"error\": \"Could not find search field\"}"
     }
 
-    // Try static text as fallback
-    if let textEl = findElement(in: elements, text: name) {
-        clickElement(textEl)
-        Thread.sleep(forTimeInterval: 0.8)
-        return "{\"success\": true, \"chat\": \"\(name)\", \"note\": \"clicked text element\"}"
+    clickElement(searchField)
+    Thread.sleep(forTimeInterval: 0.3)
+    _ = pasteText(query)
+    Thread.sleep(forTimeInterval: 1.5)
+
+    let resultElements = traverseAXTree(pid: pid)
+
+    // Find section headings to categorize results
+    let headings = findElements(in: resultElements, role: "AXHeading")
+    var chatsHeadingY: Double? = nil
+    var contactsHeadingY: Double? = nil
+    var mediaHeadingY: Double? = nil
+    for h in headings {
+        let text = cleanUnicode(h.description ?? h.title ?? "").lowercased()
+        if text == "chats" && h.x >= searchResultMinX { chatsHeadingY = h.y }
+        if text.contains("contact") && h.x >= searchResultMinX { contactsHeadingY = h.y }
+        if text == "media" && h.x >= searchResultMinX { mediaHeadingY = h.y }
     }
 
-    return "{\"success\": false, \"error\": \"Chat not found: \(name). Try scrolling or searching.\"}"
+    // Collect all search result buttons — ONLY those below the first section heading
+    // (buttons above headings are ghost/container duplicates)
+    let firstSectionY = [chatsHeadingY, contactsHeadingY].compactMap { $0 }.min()
+    let buttons = findElements(in: resultElements, role: "AXButton")
+    var candidates: [(btn: AXElementInfo, section: String)] = []
+
+    for btn in buttons {
+        guard isSearchResultButton(btn) else { continue }
+
+        // Skip buttons above the first section heading (ghost/container elements)
+        if let firstY = firstSectionY, btn.y < firstY { continue }
+
+        // Skip media section
+        if let mediaY = mediaHeadingY, btn.y >= mediaY { continue }
+
+        // Determine section based on y position relative to headings
+        var section = "chats"
+        if let contactsY = contactsHeadingY, btn.y >= contactsY { section = "contacts" }
+        else if let chatsY = chatsHeadingY, btn.y >= chatsY { section = "chats" }
+
+        candidates.append((btn: btn, section: section))
+    }
+
+    // Sort by y position (top to bottom on screen — but note: y values may be negative, more negative = higher)
+    candidates.sort { $0.btn.y < $1.btn.y }
+
+    // Build results
+    var results: [SearchResult] = []
+    for (idx, entry) in candidates.enumerated() {
+        let rawDesc = cleanUnicode(entry.btn.bestText)
+        let parsed = parseButtonDescription(rawDesc)
+
+        results.append(SearchResult(
+            index: idx,
+            section: entry.section,
+            contactName: parsed.contactName,
+            rawDescription: String(rawDesc.prefix(200)),
+            preview: parsed.preview.map { String($0.prefix(150)) },
+            time: parsed.time
+        ))
+    }
+
+    fputs("log: handleSearch: query='\(query)', found \(results.count) results\n", stderr)
+
+    // NOTE: search is left OPEN so caller can use whatsapp_open_chat with an index
+    return serializeToJsonString(results) ?? "[]"
+}
+
+// whatsapp_open_chat: clicks the Nth search result (call whatsapp_search first), then reports active chat
+func handleOpenChat(args: [String: Value]?) throws -> String {
+    let index = (try getOptionalInt(from: args, key: "index")) ?? 0
+    let pid = try ensureWhatsAppRunning()
+    activateWhatsApp(pid: pid)
+    Thread.sleep(forTimeInterval: 0.3)
+
+    let elements = traverseAXTree(pid: pid)
+
+    // Get section headings to filter results
+    let headings = findElements(in: elements, role: "AXHeading")
+    var chatsHeadingY: Double? = nil
+    var contactsHeadingY: Double? = nil
+    var mediaHeadingY: Double? = nil
+    for h in headings {
+        let text = cleanUnicode(h.description ?? h.title ?? "").lowercased()
+        if text == "chats" && h.x >= searchResultMinX { chatsHeadingY = h.y }
+        if text.contains("contact") && h.x >= searchResultMinX { contactsHeadingY = h.y }
+        if text == "media" && h.x >= searchResultMinX { mediaHeadingY = h.y }
+    }
+
+    let firstSectionY = [chatsHeadingY, contactsHeadingY].compactMap { $0 }.min()
+    let buttons = findElements(in: elements, role: "AXButton")
+    var candidates: [AXElementInfo] = []
+    for btn in buttons {
+        guard isSearchResultButton(btn) else { continue }
+        if let firstY = firstSectionY, btn.y < firstY { continue }
+        if let mediaY = mediaHeadingY, btn.y >= mediaY { continue }
+        candidates.append(btn)
+    }
+    candidates.sort { $0.y < $1.y }
+
+    guard index < candidates.count else {
+        pressEscape()
+        return "{\"success\": false, \"error\": \"Index \(index) out of range. Found \(candidates.count) results.\", \"active_chat\": null}"
+    }
+
+    let target = candidates[index]
+    let targetDesc = cleanUnicode(target.bestText)
+    fputs("log: clicking result \(index): '\(targetDesc.prefix(80))' at (\(target.x),\(target.y))\n", stderr)
+    clickElement(target)
+    Thread.sleep(forTimeInterval: 1.0)
+
+    let activeName = getActiveChatName(pid: pid)
+    return "{\"success\": true, \"clicked_description\": \"\(targetDesc.prefix(80).replacingOccurrences(of: "\"", with: "\\\""))\", \"active_chat\": \"\(activeName ?? "unknown")\"}"
+}
+
+// whatsapp_scroll_search: scroll within search results to load more
+func handleScrollSearch(args: [String: Value]?) throws -> String {
+    let direction = getOptionalString(from: args, key: "direction") ?? "down"
+    let amount = (try getOptionalInt(from: args, key: "amount")) ?? 3
+    let pid = try ensureWhatsAppRunning()
+    activateWhatsApp(pid: pid)
+    Thread.sleep(forTimeInterval: 0.3)
+
+    // Find the search results area (buttons in sidebar)
+    let elements = traverseAXTree(pid: pid)
+    let buttons = findElements(in: elements, role: "AXButton").filter { isSearchResultButton($0) }
+
+    guard let firstBtn = buttons.first else {
+        return "{\"success\": false, \"error\": \"No search results visible to scroll\"}"
+    }
+
+    // Scroll in the middle of the search results area
+    let scrollX = firstBtn.x + firstBtn.width / 2
+    let scrollY = firstBtn.y + 100  // scroll area
+    let delta: Int32 = direction == "up" ? Int32(amount) : -Int32(amount)
+
+    scrollAt(x: scrollX, y: scrollY, deltaY: delta)
+    Thread.sleep(forTimeInterval: 0.5)
+
+    // Return updated results count
+    let newElements = traverseAXTree(pid: pid)
+    let newButtons = findElements(in: newElements, role: "AXButton").filter { isSearchResultButton($0) }
+    return "{\"success\": true, \"direction\": \"\(direction)\", \"visible_results\": \(newButtons.count)}"
 }
 
 func handleReadMessages(args: [String: Value]?) throws -> String {
     let pid = try ensureWhatsAppRunning()
     let limit = (try getOptionalInt(from: args, key: "limit")) ?? 20
-
     let elements = traverseAXTree(pid: pid)
-
-    // Messages in WhatsApp are AXGenericElement with descriptions like:
-    // "message, Hello there!, 10:30 AM, Received from John"
-    // "Your message, Hi!, 10:31 AM, Sent to John"
-    // Also check AXStaticText for message content
-    var messages: [MessageInfo] = []
-
-    let genericElements = findElements(in: elements, role: "AXGenericElement")
-    for el in genericElements {
-        let desc = el.description ?? ""
-        if desc.isEmpty { continue }
-
-        // Parse "message, <text>, <time>, Received from <name>"
-        if desc.hasPrefix("message, ") || desc.hasPrefix("Your message, ") {
-            let isFromMe = desc.hasPrefix("Your message, ")
-            let prefix = isFromMe ? "Your message, " : "message, "
-            let rest = String(desc.dropFirst(prefix.count))
-
-            // Split by ", " — but message text may contain commas
-            // The pattern ends with ", <time>, Received from <name>" or ", <time>, Sent to <name>"
-            var sender = ""
-            var time = ""
-            var text = rest
-
-            // Try to extract "Received from X" or "Sent to X" from the end
-            if let receivedRange = rest.range(of: #",\s+Received from (.+)$"#, options: .regularExpression) {
-                let receivedPart = String(rest[receivedRange])
-                sender = receivedPart.replacingOccurrences(of: #"^,\s+Received from "#, with: "", options: .regularExpression)
-                text = String(rest[rest.startIndex..<receivedRange.lowerBound])
-            } else if let sentRange = rest.range(of: #",\s+Sent to (.+)$"#, options: .regularExpression) {
-                let sentPart = String(rest[sentRange])
-                sender = sentPart.replacingOccurrences(of: #"^,\s+Sent to "#, with: "", options: .regularExpression)
-                text = String(rest[rest.startIndex..<sentRange.lowerBound])
-            }
-
-            // Try to extract time from the remaining text (last ", HH:MM AM/PM" or similar)
-            if let timeRange = text.range(of: #",\s+\d{1,2}:\d{2}\s*[APap][Mm]?$"#, options: .regularExpression) {
-                time = String(text[timeRange]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
-                text = String(text[text.startIndex..<timeRange.lowerBound])
-            } else if let timeRange24 = text.range(of: #",\s+\d{1,2}:\d{2}$"#, options: .regularExpression) {
-                time = String(text[timeRange24]).trimmingCharacters(in: CharacterSet(charactersIn: ", "))
-                text = String(text[text.startIndex..<timeRange24.lowerBound])
-            }
-
-            messages.append(MessageInfo(
-                sender: isFromMe ? "me" : sender.trimmingCharacters(in: .whitespaces),
-                text: text.trimmingCharacters(in: .whitespaces),
-                time: time,
-                isFromMe: isFromMe
-            ))
-        }
-    }
-
-    // Take only the last N messages
-    let limitedMessages = Array(messages.suffix(limit))
-    return serializeToJsonString(limitedMessages) ?? "[]"
+    let messages = parseMessages(from: elements, limit: limit)
+    return serializeToJsonString(messages) ?? "[]"
 }
 
+// whatsapp_send_message: sends a message in the CURRENTLY OPEN chat (no searching)
 func handleSendMessage(args: [String: Value]?) throws -> String {
-    let name = try getRequiredString(from: args, key: "name")
     let message = try getRequiredString(from: args, key: "message")
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
-    Thread.sleep(forTimeInterval: 0.5)
+    Thread.sleep(forTimeInterval: 0.3)
 
-    // Step 1: Open the chat
+    // Verify there's an active chat
+    guard let activeName = getActiveChatName(pid: pid), !activeName.isEmpty else {
+        return "{\"success\": false, \"error\": \"No chat is currently open. Use whatsapp_search + whatsapp_open_chat first.\"}"
+    }
+
     let elements = traverseAXTree(pid: pid)
-
-    // Check if we're already in the right chat by looking at the heading
-    var needToOpen = true
-    if let heading = findElement(in: elements, text: name, role: "AXHeading") {
-        fputs("log: already in chat with \(heading.description ?? name)\n", stderr)
-        needToOpen = false
-    }
-
-    if needToOpen {
-        if let chatBtn = findElement(in: elements, text: name, role: "AXButton") {
-            clickElement(chatBtn)
-            Thread.sleep(forTimeInterval: 0.8)
-        } else {
-            // Try search
-            fputs("log: chat not found in sidebar, trying search\n", stderr)
-            if let searchBtn = findElement(in: elements, text: "Search", role: "AXButton") {
-                clickElement(searchBtn)
-                Thread.sleep(forTimeInterval: 0.5)
-            }
-            // Look for search text field
-            let searchElements = traverseAXTree(pid: pid)
-            if let searchField = findElement(in: searchElements, text: "Search", role: "AXTextField") ??
-               findElements(in: searchElements, role: "AXTextField").first {
-                clickElement(searchField)
-                Thread.sleep(forTimeInterval: 0.3)
-                _ = pasteText(name)
-                Thread.sleep(forTimeInterval: 1.0)
-
-                let results = traverseAXTree(pid: pid)
-                if let result = findElement(in: results, text: name, role: "AXButton") ??
-                   findElement(in: results, text: name) {
-                    clickElement(result)
-                    Thread.sleep(forTimeInterval: 0.8)
-                } else {
-                    return "{\"success\": false, \"error\": \"Contact not found: \(name)\"}"
-                }
-            } else {
-                return "{\"success\": false, \"error\": \"Could not find search field or chat: \(name)\"}"
-            }
-        }
-    }
-
-    // Step 2: Find compose field and type message
-    let chatElements = traverseAXTree(pid: pid)
-
-    // Verify we're in the right chat
-    if let heading = findElement(in: chatElements, text: name, role: "AXHeading") {
-        fputs("log: verified chat heading: \(heading.description ?? heading.title ?? "?")\n", stderr)
-    }
-
-    // Find the compose text area
-    let textAreas = findElements(in: chatElements, role: "AXTextArea")
+    let textAreas = findElements(in: elements, role: "AXTextArea")
     let composeField = textAreas.first(where: {
         ($0.description ?? "").lowercased().contains("compose") ||
         ($0.description ?? "").lowercased().contains("message") ||
@@ -511,76 +858,52 @@ func handleSendMessage(args: [String: Value]?) throws -> String {
         return "{\"success\": false, \"error\": \"Could not find compose message field\"}"
     }
 
-    // Click compose field
     clickElement(compose)
     Thread.sleep(forTimeInterval: 0.3)
 
-    // Type message via paste
     guard pasteText(message) else {
         return "{\"success\": false, \"error\": \"Failed to paste message text\"}"
     }
     Thread.sleep(forTimeInterval: 0.3)
 
-    // Press Return to send
     pressReturn()
-    Thread.sleep(forTimeInterval: 0.5)
+    Thread.sleep(forTimeInterval: 1.0)
 
-    return "{\"success\": true, \"to\": \"\(name)\", \"message\": \"\(message.prefix(100))\"}"
-}
+    // Post-send verification: check if last message in chat matches what we sent
+    let postElements = traverseAXTree(pid: pid)
+    let genericElements = findElements(in: postElements, role: "AXGenericElement")
 
-func handleSearch(args: [String: Value]?) throws -> String {
-    let query = try getRequiredString(from: args, key: "query")
-    let pid = try ensureWhatsAppRunning()
-    activateWhatsApp(pid: pid)
-    Thread.sleep(forTimeInterval: 0.5)
-
-    let elements = traverseAXTree(pid: pid)
-
-    // Click search button or field
-    if let searchBtn = findElement(in: elements, text: "Search", role: "AXButton") {
-        clickElement(searchBtn)
-        Thread.sleep(forTimeInterval: 0.5)
+    var lastSentMessage: String? = nil
+    for el in genericElements {
+        let desc = cleanUnicode(el.description ?? "")
+        if desc.hasPrefix("Your message, ") {
+            // Extract just the message text
+            let rest = String(desc.dropFirst("Your message, ".count))
+            // Strip time and "Sent to..." suffix
+            var text = rest
+            if let timeRange = text.range(of: #",\s+\d{1,2}:\d{2}\s*[APap][Mm]"#, options: .regularExpression) {
+                text = String(text[text.startIndex..<timeRange.lowerBound])
+            }
+            lastSentMessage = text.trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+        }
     }
 
-    // Find and click search text field
-    let afterClickElements = traverseAXTree(pid: pid)
-    let textFields = findElements(in: afterClickElements, role: "AXTextField")
-    let searchField = textFields.first(where: {
-        ($0.description ?? "").lowercased().contains("search")
-    }) ?? textFields.first
-
-    guard let field = searchField else {
-        return "{\"error\": \"Could not find search field\"}"
+    let verified: Bool
+    let escapedMessage = message.prefix(100).replacingOccurrences(of: "\"", with: "\\\"")
+    if let lastSent = lastSentMessage {
+        // Check if our message appears in the last sent message (handles emoji/unicode differences)
+        let sentNormalized = lastSent.lowercased().trimmingCharacters(in: .whitespaces)
+        let msgNormalized = message.lowercased().trimmingCharacters(in: .whitespaces)
+        verified = sentNormalized.hasPrefix(msgNormalized) || msgNormalized.hasPrefix(sentNormalized) || sentNormalized.contains(msgNormalized)
+    } else {
+        verified = false
     }
 
-    clickElement(field)
-    Thread.sleep(forTimeInterval: 0.3)
-
-    // Clear and type query
-    sendKeyEvent(keyCode: 0, flags: .maskCommand) // Cmd+A
-    Thread.sleep(forTimeInterval: 0.1)
-    _ = pasteText(query)
-    Thread.sleep(forTimeInterval: 1.5) // Wait for results
-
-    // Read results
-    let resultElements = traverseAXTree(pid: pid)
-    var results: [[String: String]] = []
-
-    let buttons = findElements(in: resultElements, role: "AXButton")
-    for btn in buttons {
-        let desc = btn.description ?? ""
-        let val = btn.value ?? ""
-        if desc.isEmpty { continue }
-        let descLower = desc.lowercased()
-        // Skip nav buttons
-        if ["chats", "calls", "updates", "settings", "search", "back", "close", "all", "unread", "favorites", "groups"].contains(descLower) { continue }
-        results.append(["name": desc, "preview": val])
+    if verified {
+        return "{\"success\": true, \"verified\": true, \"to\": \"\(activeName)\", \"message\": \"\(escapedMessage)\"}"
+    } else {
+        return "{\"success\": true, \"verified\": false, \"to\": \"\(activeName)\", \"message\": \"\(escapedMessage)\", \"warning\": \"Could not verify message appeared in chat. Last sent message: \(lastSentMessage?.prefix(80).replacingOccurrences(of: "\"", with: "\\\"") ?? "none found")\"}"
     }
-
-    // Close search with Escape
-    pressEscape()
-
-    return serializeToJsonString(results) ?? "[]"
 }
 
 func handleNavigate(args: [String: Value]?) throws -> String {
@@ -590,8 +913,6 @@ func handleNavigate(args: [String: Value]?) throws -> String {
     Thread.sleep(forTimeInterval: 0.3)
 
     let elements = traverseAXTree(pid: pid)
-
-    // Map tab names
     let tabName: String
     switch tab.lowercased() {
     case "chats": tabName = "Chats"
@@ -617,15 +938,28 @@ func handleNavigate(args: [String: Value]?) throws -> String {
 func setupAndStartServer() async throws -> Server {
     fputs("log: setupAndStartServer: entering function.\n", stderr)
 
-    // --- Tool Definitions ---
-
     let statusTool = Tool(
         name: "whatsapp_status",
-        description: "Check if WhatsApp is running and accessibility is granted. Returns JSON with whatsappRunning, pid, accessibilityTrusted.",
-        inputSchema: .object([
-            "type": .string("object"),
-            "properties": .object([:])
-        ])
+        description: "Check if WhatsApp is running and accessibility is granted.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])])
+    )
+
+    let startTool = Tool(
+        name: "whatsapp_start",
+        description: "Launch WhatsApp if not already running. Returns PID.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])])
+    )
+
+    let quitTool = Tool(
+        name: "whatsapp_quit",
+        description: "Quit/close WhatsApp.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])])
+    )
+
+    let getActiveChatTool = Tool(
+        name: "whatsapp_get_active_chat",
+        description: "Returns the name of the currently open/active WhatsApp chat. Use this to verify which chat is open before sending a message.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])])
     )
 
     let listChatsTool = Tool(
@@ -643,21 +977,48 @@ func setupAndStartServer() async throws -> Server {
         ])
     )
 
-    let openChatTool = Tool(
-        name: "whatsapp_open_chat",
-        description: "Open a chat by clicking it in the WhatsApp sidebar. Returns success/failure.",
+    let searchTool = Tool(
+        name: "whatsapp_search",
+        description: """
+        Search WhatsApp contacts/chats. Returns structured results with: index, section (chats/contacts), contactName, rawDescription, preview, time.
+        Leaves search OPEN — call whatsapp_open_chat(index) to select a result.
+        If the contact you want isn't visible, use whatsapp_scroll_search to load more results.
+        """,
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
-                "name": .object(["type": .string("string"), "description": .string("Contact or group name to open")])
+                "query": .object(["type": .string("string"), "description": .string("Search query text")])
             ]),
-            "required": .array([.string("name")])
+            "required": .array([.string("query")])
+        ])
+    )
+
+    let openChatTool = Tool(
+        name: "whatsapp_open_chat",
+        description: "Click the Nth search result to open that chat. Call whatsapp_search first, then use the index from the results. Returns the name of the chat that was actually opened — verify this matches your intended contact.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "index": .object(["type": .string("integer"), "description": .string("0-based index of the search result to click. Default: 0 (first result)")])
+            ])
+        ])
+    )
+
+    let scrollSearchTool = Tool(
+        name: "whatsapp_scroll_search",
+        description: "Scroll within the search results list to load more results. Use after whatsapp_search if the desired contact isn't visible.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "direction": .object(["type": .string("string"), "description": .string("Scroll direction: 'up' or 'down'. Default: 'down'"), "enum": .array([.string("up"), .string("down")])]),
+                "amount": .object(["type": .string("integer"), "description": .string("Number of scroll lines. Default: 3")])
+            ])
         ])
     )
 
     let readMessagesTool = Tool(
         name: "whatsapp_read_messages",
-        description: "Read messages from the currently open WhatsApp chat. Returns array of messages with sender, text, time, and direction.",
+        description: "Read messages from the currently open WhatsApp chat. Returns sender, text, time, and isFromMe for each message.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
@@ -668,26 +1029,13 @@ func setupAndStartServer() async throws -> Server {
 
     let sendMessageTool = Tool(
         name: "whatsapp_send_message",
-        description: "Send a message to a WhatsApp contact. Opens the chat, types the message, and presses Return to send.",
+        description: "Send a message in the CURRENTLY OPEN chat. Does NOT search or navigate — it only types and sends. Use whatsapp_search + whatsapp_open_chat + whatsapp_get_active_chat to verify the right chat first.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
-                "name": .object(["type": .string("string"), "description": .string("Recipient contact or group name")]),
                 "message": .object(["type": .string("string"), "description": .string("Message text to send")])
             ]),
-            "required": .array([.string("name"), .string("message")])
-        ])
-    )
-
-    let searchTool = Tool(
-        name: "whatsapp_search",
-        description: "Search WhatsApp chats and messages by query text.",
-        inputSchema: .object([
-            "type": .string("object"),
-            "properties": .object([
-                "query": .object(["type": .string("string"), "description": .string("Search query text")])
-            ]),
-            "required": .array([.string("query")])
+            "required": .array([.string("message")])
         ])
     )
 
@@ -707,20 +1055,26 @@ func setupAndStartServer() async throws -> Server {
         ])
     )
 
-    let allTools = [statusTool, listChatsTool, openChatTool, readMessagesTool, sendMessageTool, searchTool, navigateTool]
+    let allTools = [statusTool, startTool, quitTool, getActiveChatTool, listChatsTool, searchTool, openChatTool, scrollSearchTool, readMessagesTool, sendMessageTool, navigateTool]
     fputs("log: setupAndStartServer: defined \(allTools.count) tools\n", stderr)
 
     let server = Server(
         name: "WhatsAppMCP",
-        version: "1.0.0",
+        version: "3.0.0",
         instructions: """
         WhatsApp MCP server for macOS. Controls the native WhatsApp Catalyst app via accessibility APIs.
-        Tools: whatsapp_status, whatsapp_list_chats, whatsapp_open_chat, whatsapp_read_messages, whatsapp_send_message, whatsapp_search, whatsapp_navigate.
+        Tools: whatsapp_status, whatsapp_start, whatsapp_quit, whatsapp_get_active_chat, whatsapp_list_chats, whatsapp_search, whatsapp_open_chat, whatsapp_scroll_search, whatsapp_read_messages, whatsapp_send_message, whatsapp_navigate.
         WhatsApp must be installed and accessibility permissions must be granted.
+
+        IMPORTANT workflow for sending messages:
+        1. whatsapp_search("contact name") — returns indexed results, leaves search open
+        2. whatsapp_open_chat(index: 0) — clicks the first result, returns the active chat name
+        3. whatsapp_get_active_chat() — verify the correct chat is open
+        4. whatsapp_send_message("your message") — sends in the currently open chat
+
+        When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.
         """,
-        capabilities: .init(
-            tools: .init(listChanged: true)
-        )
+        capabilities: .init(tools: .init(listChanged: true))
     )
 
     await server.withMethodHandler(ReadResource.self) { params in
@@ -746,16 +1100,24 @@ func setupAndStartServer() async throws -> Server {
             switch params.name {
             case "whatsapp_status":
                 result = handleStatus()
+            case "whatsapp_start":
+                result = handleStart()
+            case "whatsapp_quit":
+                result = handleQuit()
+            case "whatsapp_get_active_chat":
+                result = try handleGetActiveChat(args: params.arguments)
             case "whatsapp_list_chats":
                 result = try handleListChats(args: params.arguments)
+            case "whatsapp_search":
+                result = try handleSearch(args: params.arguments)
             case "whatsapp_open_chat":
                 result = try handleOpenChat(args: params.arguments)
+            case "whatsapp_scroll_search":
+                result = try handleScrollSearch(args: params.arguments)
             case "whatsapp_read_messages":
                 result = try handleReadMessages(args: params.arguments)
             case "whatsapp_send_message":
                 result = try handleSendMessage(args: params.arguments)
-            case "whatsapp_search":
-                result = try handleSearch(args: params.arguments)
             case "whatsapp_navigate":
                 result = try handleNavigate(args: params.arguments)
             default:
