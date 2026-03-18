@@ -1,7 +1,7 @@
 ---
 name: whatsapp-macos
-description: "Control WhatsApp desktop (macOS Catalyst app) via native MCP tools. Send messages, read chats, search conversations, navigate settings. Use when: 'WhatsApp message', 'send WhatsApp', 'check WhatsApp', 'text someone on WhatsApp', 'read WhatsApp messages', 'WhatsApp unread', 'open WhatsApp'."
-allowed-tools: mcp__whatsapp__whatsapp_status, mcp__whatsapp__whatsapp_list_chats, mcp__whatsapp__whatsapp_open_chat, mcp__whatsapp__whatsapp_read_messages, mcp__whatsapp__whatsapp_send_message, mcp__whatsapp__whatsapp_search, mcp__whatsapp__whatsapp_navigate
+description: "Control WhatsApp desktop (macOS Catalyst app) via native MCP tools. Send messages, read chats, search contacts, verify delivery, start/quit app. Use when: 'WhatsApp message', 'send WhatsApp', 'check WhatsApp', 'text someone on WhatsApp', 'read WhatsApp messages', 'WhatsApp unread', 'open WhatsApp'."
+allowed-tools: mcp__whatsapp__whatsapp_status, mcp__whatsapp__whatsapp_start, mcp__whatsapp__whatsapp_quit, mcp__whatsapp__whatsapp_get_active_chat, mcp__whatsapp__whatsapp_list_chats, mcp__whatsapp__whatsapp_search, mcp__whatsapp__whatsapp_open_chat, mcp__whatsapp__whatsapp_scroll_search, mcp__whatsapp__whatsapp_read_messages, mcp__whatsapp__whatsapp_send_message, mcp__whatsapp__whatsapp_navigate
 ---
 
 # WhatsApp macOS MCP Skill
@@ -13,48 +13,63 @@ Control the native WhatsApp Catalyst app via dedicated MCP tools. No manual PID 
 | Tool | Description | Key params |
 |------|-------------|-----------|
 | `whatsapp_status` | Check if WhatsApp is running, accessibility granted | (none) |
-| `whatsapp_list_chats` | List visible chats with names, last message, unread count | `filter`: "all"/"unread"/"favorites"/"groups" |
-| `whatsapp_open_chat` | Open a chat by clicking it in sidebar | `name`: contact/group name |
+| `whatsapp_start` | Launch WhatsApp if not running | (none) |
+| `whatsapp_quit` | Quit WhatsApp | (none) |
+| `whatsapp_search` | Search contacts/chats, returns indexed structured results | `query`: search text |
+| `whatsapp_open_chat` | Click Nth search result to open chat | `index`: 0-based result index |
+| `whatsapp_get_active_chat` | Get current chat name, subtitle, recent messages | `limit`: max messages (default 10) |
+| `whatsapp_send_message` | Send message in current chat with delivery verification | `message`: text to send |
 | `whatsapp_read_messages` | Read messages from current open chat | `limit`: max messages (default 20) |
-| `whatsapp_send_message` | Send message to a contact (opens chat + types + sends) | `name`: recipient, `message`: text |
-| `whatsapp_search` | Search chats/messages | `query`: search text |
+| `whatsapp_scroll_search` | Scroll search results to load more | `direction`: "up"/"down", `amount`: lines |
+| `whatsapp_list_chats` | List visible sidebar chats | `filter`: "all"/"unread"/"favorites"/"groups" |
 | `whatsapp_navigate` | Switch tabs | `tab`: "chats"/"calls"/"updates"/"settings"/"archived"/"starred" |
 
-## Workflows
+## Workflow: Send a Message
 
-### Check Status
-Call `whatsapp_status` — returns `whatsappRunning`, `pid`, `accessibilityTrusted`.
+This is the REQUIRED workflow. Do NOT skip steps.
 
-### List Chats
-Call `whatsapp_list_chats` with optional `filter`. Returns JSON array of `{name, lastMessage, unreadCount}`.
+1. `whatsapp_search("contact name")` — returns indexed results with section (chats/contacts), contactName, preview, time
+2. `whatsapp_open_chat(index: N)` — click the correct result, returns the active chat name
+3. `whatsapp_get_active_chat()` — **verify** the correct chat is open (check name matches intended recipient)
+4. `whatsapp_send_message("your message")` — sends in current chat, returns `verified: true/false`
 
-### Read Messages
-1. `whatsapp_open_chat` with the contact name
-2. `whatsapp_read_messages` with optional `limit`
-Returns `{sender, text, time, isFromMe}` array.
+If the contact isn't in the initial results, use `whatsapp_scroll_search(direction: "down")` to load more.
 
-### Send Message
-Call `whatsapp_send_message` with `name` and `message`. The tool handles: finding the chat, opening it, clicking compose, pasting text, pressing Return.
+## Workflow: Read Messages
 
-### Search
-Call `whatsapp_search` with `query`. Returns matching chat names and previews.
+1. `whatsapp_search("contact name")` → find the chat
+2. `whatsapp_open_chat(index: N)` → open it
+3. `whatsapp_get_active_chat()` → returns name + recent messages in one call
+4. Or use `whatsapp_read_messages(limit: 50)` for more messages
 
-### Navigate
-Call `whatsapp_navigate` with `tab` name.
+## Search Result Format
+
+Each search result includes:
+- `index` — 0-based position for `whatsapp_open_chat`
+- `section` — "chats" or "contacts"
+- `contactName` — parsed contact name (may be null for some chats)
+- `rawDescription` — full accessibility description
+- `preview` — last message preview
+- `time` — timestamp
 
 ## Safety
 
 - **Always confirm with user** before sending messages unless they gave explicit instructions
-- The send tool verifies the chat heading matches the intended recipient
-- If a contact isn't found, the tool tries search as fallback
+- Always verify the active chat name matches the intended recipient before sending
+- The send tool includes post-send verification (reads back last message)
 
 ## Setup
 
-The MCP server must be registered in `~/.claude/settings.json`:
+The MCP server must be registered in `~/.claude.json`:
 ```json
 "whatsapp": {
-  "command": "/Users/matthewdi/whatsapp-mcp-skill-macos/bin/whatsapp-mcp"
+  "type": "stdio",
+  "command": "whatsapp-mcp",
+  "args": [],
+  "env": {}
 }
 ```
 
-Requires: WhatsApp desktop installed, accessibility permissions granted.
+Install via: `npm install -g whatsapp-mcp-macos`
+
+Requires: WhatsApp desktop installed, macOS accessibility permissions granted.

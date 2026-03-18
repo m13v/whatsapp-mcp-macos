@@ -1,12 +1,30 @@
 {
-  "name": "whatsapp-mcp",
+  "name": "whatsapp-mcp-macos",
   "version": "1.0.0",
-  "description": "WhatsApp MCP server for macOS - controls WhatsApp via accessibility APIs",
+  "description": "WhatsApp MCP server for macOS — control WhatsApp via accessibility APIs",
+  "keywords": ["whatsapp", "mcp", "macos", "accessibility", "model-context-protocol", "claude", "ai"],
+  "author": "m13v",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m13v/whatsapp-mcp-macos.git"
+  },
+  "homepage": "https://github.com/m13v/whatsapp-mcp-macos",
+  "os": ["darwin"],
   "scripts": {
     "postinstall": "xcrun swift build -c release",
     "build": "xcrun swift build -c release"
   },
   "bin": {
     "whatsapp-mcp": "bin/whatsapp-mcp"
-  }
+  },
+  "files": [
+    "bin/",
+    "Sources/",
+    "Package.swift",
+    "Package.resolved",
+    "README.md",
+    "SKILL.md",
+    "LICENSE"
+  ]
 }
