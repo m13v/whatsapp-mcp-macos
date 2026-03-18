@@ -1,0 +1,12 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "1.0.0",
+  "description": "WhatsApp MCP server for macOS - controls WhatsApp via accessibility APIs",
+  "scripts": {
+    "postinstall": "xcrun swift build -c release",
+    "build": "xcrun swift build -c release"
+  },
+  "bin": {
+    "whatsapp-mcp": "bin/whatsapp-mcp"
+  }
+}
