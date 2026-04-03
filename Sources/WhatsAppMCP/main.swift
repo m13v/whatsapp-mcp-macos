@@ -555,6 +555,32 @@ func isSearchResultButton(_ btn: AXElementInfo) -> Bool {
     return true
 }
 
+// MARK: - Accessibility Guard
+
+/// Check accessibility and return a clear, actionable error if not granted.
+/// Call this at the top of every tool that uses AX APIs or CGEvent posting.
+func requireAccessibility() -> String? {
+    let trusted = AXIsProcessTrustedWithOptions(
+        [kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary
+    )
+    if trusted { return nil }
+    return serializeToJsonString([
+        "error": "Accessibility permission not granted. The user must enable it in System Settings > Privacy & Security > Accessibility for the app running this MCP server. Without this permission, WhatsApp cannot be controlled.",
+        "fix": "Open System Settings > Privacy & Security > Accessibility and toggle ON the app that hosts whatsapp-mcp (e.g. Fazm, Claude Code, or Terminal).",
+        "accessibilityTrusted": "false"
+    ]) ?? "{\"error\": \"Accessibility permission not granted.\"}"
+}
+
+/// Functional probe: actually try to read the AX tree and verify we get elements back.
+/// AXIsProcessTrusted can return true while AX calls silently fail (stale TCC cache).
+func probeAccessibility(pid: pid_t) -> Bool {
+    let appElement = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(appElement, 2.0)
+    var childrenRef: CFTypeRef?
+    let result = AXUIElementCopyAttributeValue(appElement, kAXChildrenAttribute as CFString, &childrenRef)
+    return result == .success && childrenRef != nil
+}
+
 // MARK: - Tool Implementations
 
 func handleStatus() -> String {
@@ -562,7 +588,22 @@ func handleStatus() -> String {
     let trusted = AXIsProcessTrustedWithOptions(
         [kAXTrustedCheckOptionPrompt.takeRetainedValue(): false] as CFDictionary
     )
-    let status = StatusInfo(whatsappRunning: pid != nil, pid: pid.map { Int($0) }, accessibilityTrusted: trusted)
+    // If TCC says trusted and WhatsApp is running, do a functional probe
+    var functionallyWorking: Bool? = nil
+    if trusted, let pid = pid {
+        functionallyWorking = probeAccessibility(pid: pid)
+    }
+    let status: [String: String] = [
+        "whatsappRunning": pid != nil ? "true" : "false",
+        "pid": pid.map { "\($0)" } ?? "null",
+        "accessibilityTrusted": trusted ? "true" : "false",
+        "accessibilityWorking": functionallyWorking.map { $0 ? "true" : "false" } ?? "null"
+    ]
+    if trusted && functionallyWorking == false {
+        var s = status
+        s["warning"] = "Accessibility reports trusted but AX calls are failing. This is common after macOS updates or app re-signing. Try removing and re-adding the app in System Settings > Privacy & Security > Accessibility, then restart the app."
+        return serializeToJsonString(s) ?? "{\"error\": \"serialization failed\"}"
+    }
     return serializeToJsonString(status) ?? "{\"error\": \"serialization failed\"}"
 }
 
@@ -605,6 +646,7 @@ func handleQuit() -> String {
 }
 
 func handleGetActiveChat(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let pid = try ensureWhatsAppRunning()
     let elements = traverseAXTree(pid: pid)
     let heading = getActiveChatHeading(elements: elements)
@@ -615,6 +657,7 @@ func handleGetActiveChat(args: [String: Value]?) throws -> String {
 }
 
 func handleListChats(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
     Thread.sleep(forTimeInterval: 0.5)
@@ -672,6 +715,7 @@ func handleListChats(args: [String: Value]?) throws -> String {
 
 // whatsapp_search: types query into sidebar search, returns indexed results, leaves search OPEN
 func handleSearch(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let query = try getRequiredString(from: args, key: "query")
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
@@ -701,6 +745,7 @@ func handleSearch(args: [String: Value]?) throws -> String {
 
 // whatsapp_open_chat: clicks the Nth search result (call whatsapp_search first), then reports active chat
 func handleOpenChat(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let index = (try getOptionalInt(from: args, key: "index")) ?? 0
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
@@ -796,6 +841,7 @@ func parseVisibleSearchResults(from elements: [AXElementInfo]) -> [SearchResult]
 
 // whatsapp_scroll_search: scroll within search results to load more
 func handleScrollSearch(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let direction = getOptionalString(from: args, key: "direction") ?? "down"
     let amount = (try getOptionalInt(from: args, key: "amount")) ?? 3
     let pid = try ensureWhatsAppRunning()
@@ -830,6 +876,7 @@ func handleScrollSearch(args: [String: Value]?) throws -> String {
 }
 
 func handleReadMessages(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let pid = try ensureWhatsAppRunning()
     let limit = (try getOptionalInt(from: args, key: "limit")) ?? 20
     let elements = traverseAXTree(pid: pid)
@@ -839,6 +886,7 @@ func handleReadMessages(args: [String: Value]?) throws -> String {
 
 // whatsapp_send_message: sends a message in the CURRENTLY OPEN chat (no searching)
 func handleSendMessage(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let message = try getRequiredString(from: args, key: "message")
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
@@ -910,6 +958,7 @@ func handleSendMessage(args: [String: Value]?) throws -> String {
 }
 
 func handleNavigate(args: [String: Value]?) throws -> String {
+    if let err = requireAccessibility() { return err }
     let tab = try getRequiredString(from: args, key: "tab")
     let pid = try ensureWhatsAppRunning()
     activateWhatsApp(pid: pid)
@@ -1071,9 +1120,13 @@ func setupAndStartServer() async throws -> Server {
 
         IMPORTANT workflow for sending messages:
         1. whatsapp_search("contact name") — returns indexed results, leaves search open
-        2. whatsapp_open_chat(index: 0) — clicks the first result, returns the active chat name
+        2. whatsapp_open_chat(index: 0) ��� clicks the first result, returns the active chat name
         3. whatsapp_get_active_chat() — verify the correct chat is open
         4. whatsapp_send_message("your message") — sends in the currently open chat
+
+        CRITICAL: If any tool returns an accessibility permission error, do NOT attempt to use WhatsApp Web via a browser as a fallback. Browser automation with WhatsApp Web does not work reliably (contenteditable fields, focus management issues). Instead, tell the user to grant Accessibility permission in System Settings > Privacy & Security > Accessibility for the host app, then retry.
+
+        If accessibilityWorking is false but accessibilityTrusted is true, the TCC database is stale. Tell the user to remove and re-add the app in Accessibility settings, then restart.
 
         When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.
         """,

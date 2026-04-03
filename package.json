@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-mcp-macos",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "WhatsApp MCP server for macOS — control WhatsApp via accessibility APIs",
   "keywords": [
     "whatsapp",
