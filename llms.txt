@@ -1,0 +1,134 @@
+# WhatsApp MCP for macOS
+
+> MCP server that lets AI assistants control the native WhatsApp desktop app on macOS through accessibility APIs. Search contacts, send messages, read chats, and navigate the app programmatically.
+
+## What It Is
+
+WhatsApp MCP is a Model Context Protocol (MCP) server written in Swift. It communicates over stdio and exposes 11 tools that give AI assistants (Claude, etc.) full control over WhatsApp on macOS. Instead of using the WhatsApp Web API or any unofficial REST endpoints, it drives the native WhatsApp Catalyst app directly through macOS Accessibility (AX) APIs and CGEvent-based input simulation.
+
+This means the server reads the accessibility tree to find UI elements (buttons, text fields, headings, static text), clicks them by computing screen coordinates, and types messages by pasting from the clipboard. No API keys, no browser automation, no web scraping.
+
+## Who It's For
+
+- AI assistant users who want Claude or other MCP-compatible agents to send and read WhatsApp messages on their behalf
+- Developers building automated workflows that involve WhatsApp messaging on macOS
+- Anyone who wants programmatic access to WhatsApp without relying on unofficial APIs
+
+## Requirements
+
+- **macOS 13 (Ventura) or later** (uses the Catalyst version of WhatsApp)
+- **WhatsApp desktop app** installed from the Mac App Store
+- **Accessibility permissions** granted to the host app (the app running the MCP server, such as Claude Code, Terminal, or Fazm) in System Settings > Privacy & Security > Accessibility
+- **Swift 5.9+** toolchain (Xcode or Command Line Tools) for building from source
+- **Node.js/npm** for global installation via npm
+
+## Installation
+
+Install globally via npm:
+
+```
+npm install -g whatsapp-mcp-macos
+```
+
+This runs `xcrun swift build -c release` as a postinstall step, compiling the Swift binary.
+
+Then register the MCP server in `~/.claude.json` (or your MCP client config):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "stdio",
+      "command": "whatsapp-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+After launching, grant Accessibility permission to the host app when prompted.
+
+## Available Tools
+
+### App Lifecycle
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `whatsapp_status` | Check if WhatsApp is running, whether accessibility is trusted, and whether AX calls are actually working | None |
+| `whatsapp_start` | Launch WhatsApp if not already running; returns PID | None |
+| `whatsapp_quit` | Quit WhatsApp gracefully (force-quits after 5s timeout) | None |
+
+### Search and Navigation
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `whatsapp_search` | Type a query into the sidebar search field; returns structured results with index, section, contact name, preview, and time. Leaves search open for follow-up. | `query` (required): search text |
+| `whatsapp_open_chat` | Click the Nth search result to open that chat. Returns the name of the chat that actually opened. | `index` (optional, default 0): 0-based result index |
+| `whatsapp_scroll_search` | Scroll the search results list to load more entries | `direction` (optional, default "down"): "up" or "down"; `amount` (optional, default 3): scroll lines |
+| `whatsapp_navigate` | Switch between WhatsApp tabs | `tab` (required): one of "chats", "calls", "updates", "settings", "archived", "starred" |
+
+### Reading Messages
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `whatsapp_get_active_chat` | Get the name, subtitle (online/last seen/typing), and recent messages of the currently open chat | `limit` (optional, default 10): max messages |
+| `whatsapp_read_messages` | Read messages from the currently open chat with sender, text, time, and direction | `limit` (optional, default 20): max messages |
+| `whatsapp_list_chats` | List visible sidebar chats with name, last message preview, and unread count | `filter` (optional, default "all"): "all", "unread", "favorites", or "groups" |
+
+### Sending Messages
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `whatsapp_send_message` | Send a message in the currently open chat. Includes post-send verification. | `message` (required): text to send |
+
+## Core Workflow: Sending a Message
+
+This is the required multi-step workflow. Do not skip steps.
+
+1. `whatsapp_search("contact name")` returns indexed results categorized by section (chats/contacts)
+2. `whatsapp_open_chat(index: 0)` clicks the first result and returns the active chat name
+3. `whatsapp_get_active_chat()` verifies the correct chat is open (always confirm before sending)
+4. `whatsapp_send_message("your message")` types and sends in the current chat, then verifies delivery by reading back the last message
+
+If the desired contact is not in the initial results, call `whatsapp_scroll_search(direction: "down")` to load more, then retry.
+
+## Core Workflow: Reading Messages
+
+1. `whatsapp_search("contact name")` to find the chat
+2. `whatsapp_open_chat(index: N)` to open it
+3. `whatsapp_get_active_chat()` returns name, status, and recent messages in one call
+4. For more messages, use `whatsapp_read_messages(limit: 50)`
+
+## Technical Architecture
+
+- **Language:** Swift, built with Swift Package Manager
+- **Dependencies:** [MCP Swift SDK](https://github.com/modelcontextprotocol/swift-sdk) (v0.11.0+) for the MCP protocol layer; [MacosUseSDK](https://github.com/mediar-ai/MacosUseSDK) for accessibility utilities
+- **Transport:** stdio (reads JSON-RPC from stdin, writes to stdout)
+- **UI Interaction:** Traverses the WhatsApp accessibility tree (AXUIElement APIs) to find elements by role and text, then clicks via CGEvent posting. Text input uses clipboard paste (Cmd+V) to handle Unicode correctly. Keyboard events (Return, Escape) use CGEvent key simulation.
+- **Search Result Parsing:** Parses WhatsApp's accessibility button descriptions using regex patterns to extract contact names, message previews, timestamps, and delivery status from various message formats (sent, received, group messages, added-by-contact patterns).
+- **Cursor Preservation:** Saves and restores the mouse cursor position around click and scroll operations so the user's cursor is not displaced.
+
+## Limitations
+
+- **macOS only.** This server controls the native macOS WhatsApp app and cannot run on Windows, Linux, or in containers.
+- **No WhatsApp Web fallback.** If accessibility permissions are not granted, the server cannot fall back to browser automation. WhatsApp Web's contenteditable fields and focus management make browser automation unreliable.
+- **Single-window assumption.** The accessibility tree parsing assumes standard WhatsApp window layout with specific x-coordinate thresholds for sidebar vs. chat panel elements.
+- **Visible messages only.** The server can only read messages currently rendered in the accessibility tree. It cannot access message history beyond what WhatsApp has loaded.
+- **Text messages only.** The send tool handles text. It does not support sending images, files, voice messages, or other media.
+- **No end-to-end encryption bypass.** The server reads what the WhatsApp app displays, exactly as the user would see it. It does not decrypt or intercept anything at the protocol level.
+
+## Troubleshooting
+
+- **"Accessibility permission not granted"**: Open System Settings > Privacy & Security > Accessibility and enable the host app (Terminal, Claude Code, Fazm, etc.)
+- **`accessibilityWorking: false` but `accessibilityTrusted: true`**: The TCC database is stale. Remove the app from the Accessibility list, re-add it, and restart the app.
+- **Search returns no results**: WhatsApp may still be loading. The server waits 1.5 seconds after typing the query, but slow networks may need a retry.
+
+## License
+
+MIT License. Copyright (c) 2026 m13v.
+
+## Links
+
+- GitHub: https://github.com/m13v/whatsapp-mcp-macos
+- npm: whatsapp-mcp-macos
