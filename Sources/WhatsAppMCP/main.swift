@@ -1179,12 +1179,12 @@ func setupAndStartServer() async throws -> Server {
             default:
                 throw MCPError.methodNotFound("Unknown tool: \(params.name)")
             }
-            return .init(content: [.text(result)])
+            return .init(content: [.text(text: result, annotations: nil, _meta: nil)])
         } catch let error as MCPError {
             throw error
         } catch {
             fputs("error: handler(CallTool): \(error)\n", stderr)
-            return .init(content: [.text("{\"error\": \"\(error.localizedDescription)\"}")], isError: true)
+            return .init(content: [.text(text: "{\"error\": \"\(error.localizedDescription)\"}", annotations: nil, _meta: nil)], isError: true)
         }
     }
 

@@ -18,7 +18,7 @@ An MCP (Model Context Protocol) server that lets AI assistants control the nativ
 - macOS 13+
 - WhatsApp desktop app installed
 - Accessibility permissions granted (System Settings > Privacy & Security > Accessibility)
-- Swift 5.9+ / Xcode
+- Swift 5.9+ / Xcode (builds cleanly on Swift 6.x toolchains, e.g. Xcode 26)
 
 ## Installation
 
